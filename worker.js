@@ -5,7 +5,7 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 
 const MODEL = 'gemini-3.6-flash';
-const WORKER_VERSION = '1.1.0';
+const WORKER_VERSION = '1.1.1';
 const MAX_PHOTOS = 3;
 const MAX_BASE64_CHARS_PER_PHOTO = 7_000_000;
 const EBAY_SCOPE = 'https://api.ebay.com/oauth/api_scope';
@@ -113,10 +113,38 @@ function median(values) {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
-function normalizeEbayItem(item) {
+
+function searchTokens(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter((token) => token.length >= 2);
+}
+
+function modelTokens(value) {
+  return searchTokens(value).filter((token) => /[a-z]/.test(token) && /\d/.test(token));
+}
+
+function itemMatchMetadata(title, query, modelHint) {
+  const normalizedTitle = String(title || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+  const queryTokens = searchTokens(query);
+  const exactTokens = modelTokens(modelHint || query);
+  const matched = queryTokens.filter((token) => normalizedTitle.includes(token));
+  const exactMatch = exactTokens.length > 0 && exactTokens.every((token) => normalizedTitle.includes(token));
+  return {
+    exactMatch,
+    matchScore: queryTokens.length ? Math.round((matched.length / queryTokens.length) * 100) : 0,
+  };
+}
+
+function normalizeEbayItem(item, query = '', modelHint = '') {
   const price = moneyNumber(item?.price);
   const shipping = moneyNumber(item?.shippingOptions?.[0]?.shippingCost);
+  const match = itemMatchMetadata(item?.title, query, modelHint);
   return {
+    ...match,
     itemId: String(item?.itemId || ''),
     title: String(item?.title || ''),
     price,
@@ -135,7 +163,8 @@ async function searchEbay(request, env, origin) {
   const body = await request.json().catch(() => ({}));
   const query = String(body.q || '').trim().slice(0, 200);
   const gtin = String(body.barcode || '').replace(/\D/g, '').slice(0, 14);
-  const limit = Math.max(1, Math.min(20, Number(body.limit) || 10));
+  const limit = Math.max(1, Math.min(50, Number(body.limit) || 20));
+  const modelHint = String(body.model || '').trim().slice(0, 100);
   if (!query && !gtin) return json({ error: 'EBAY_QUERY_REQUIRED' }, 400, origin);
 
   try {
@@ -154,8 +183,13 @@ async function searchEbay(request, env, origin) {
       console.error('eBay search error', response.status, JSON.stringify(payload).slice(0, 1600));
       return json({ error: 'EBAY_SEARCH_FAILED', status: response.status, details: payload?.errors?.[0]?.message || 'eBay search failed' }, response.status, origin);
     }
-    const items = (Array.isArray(payload.itemSummaries) ? payload.itemSummaries : []).map(normalizeEbayItem).filter((item) => item.title && item.price !== null);
-    const totals = items.filter((item) => item.currency === 'USD').map((item) => item.totalPrice).filter(Number.isFinite);
+    const items = (Array.isArray(payload.itemSummaries) ? payload.itemSummaries : [])
+      .map((item) => normalizeEbayItem(item, query, modelHint))
+      .filter((item) => item.title && item.price !== null)
+      .sort((a, b) => Number(b.exactMatch) - Number(a.exactMatch) || b.matchScore - a.matchScore || (a.totalPrice ?? Infinity) - (b.totalPrice ?? Infinity));
+    const exactItems = items.filter((item) => item.exactMatch);
+    const priceItems = exactItems.length >= 2 ? exactItems : items;
+    const totals = priceItems.filter((item) => item.currency === 'USD').map((item) => item.totalPrice).filter(Number.isFinite);
     return json({
       ok: true,
       query: gtin || query,
@@ -163,6 +197,8 @@ async function searchEbay(request, env, origin) {
       marketplace: EBAY_MARKETPLACE,
       total: Number(payload.total) || items.length,
       sampleCount: items.length,
+      exactCount: exactItems.length,
+      statsBasis: exactItems.length >= 2 ? 'exact-model' : 'all-results',
       price: {
         currency: 'USD',
         low: totals.length ? Math.min(...totals) : null,
