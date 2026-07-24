@@ -5,6 +5,7 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 
 const MODEL = 'gemini-3.6-flash';
+const WORKER_VERSION = '1.0.4';
 const MAX_PHOTOS = 3;
 const MAX_BASE64_CHARS_PER_PHOTO = 7_000_000;
 
@@ -20,8 +21,23 @@ function corsHeaders(origin) {
   return headers;
 }
 
-function json(data, status, origin = '') {
-  return new Response(JSON.stringify(data), { status, headers: corsHeaders(origin) });
+function json(data, status, origin = '', extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { ...corsHeaders(origin), ...extraHeaders },
+  });
+}
+
+function retryAfterSeconds(payload) {
+  const details = Array.isArray(payload?.error?.details) ? payload.error.details : [];
+  for (const detail of details) {
+    const delay = String(detail?.retryDelay || detail?.retry_delay || '');
+    const match = /^([0-9]+(?:\.[0-9]+)?)s$/.exec(delay);
+    if (match) return Math.max(1, Math.ceil(Number(match[1])));
+  }
+  const message = String(payload?.error?.message || payload?.message || '');
+  const match = /retry\s+in\s+([0-9]+(?:\.[0-9]+)?)s/i.exec(message);
+  return match ? Math.max(1, Math.ceil(Number(match[1]))) : 0;
 }
 
 function parseDataUrl(value) {
@@ -71,7 +87,7 @@ export default {
     }
 
     if (request.method === 'GET') {
-      return json({ ok: true, service: 'EAS Gemini API', version: '1.0.2', model: MODEL }, 200, origin);
+      return json({ ok: true, service: 'EAS Gemini API', version: WORKER_VERSION, model: MODEL }, 200, origin);
     }
 
     if (request.method !== 'POST') return json({ error: 'METHOD_NOT_ALLOWED' }, 405, origin);
@@ -126,8 +142,21 @@ export default {
 
       const payload = await geminiResponse.json();
       if (!geminiResponse.ok) {
-        console.error('Gemini error', geminiResponse.status, JSON.stringify(payload).slice(0, 1000));
-        return json({ error: 'GEMINI_REQUEST_FAILED', status: geminiResponse.status }, 502, origin);
+        const upstreamStatus = Number(geminiResponse.status) || 502;
+        const retrySeconds = upstreamStatus === 429 ? retryAfterSeconds(payload) : 0;
+        const upstreamMessage = String(payload?.error?.message || 'Gemini request failed').slice(0, 500);
+        console.error('Gemini error', upstreamStatus, JSON.stringify(payload).slice(0, 1600));
+
+        // Gemini의 상태 코드를 그대로 전달하여 앱이 429와 서버 오류를 구분할 수 있게 합니다.
+        const status = [400, 401, 403, 404, 408, 429].includes(upstreamStatus) || upstreamStatus >= 500
+          ? upstreamStatus
+          : 502;
+        return json({
+          error: 'GEMINI_REQUEST_FAILED',
+          status: upstreamStatus,
+          message: upstreamMessage,
+          retryAfterSeconds: retrySeconds || undefined,
+        }, status, origin, retrySeconds ? { 'Retry-After': String(retrySeconds) } : {});
       }
 
       const text = extractText(payload);
